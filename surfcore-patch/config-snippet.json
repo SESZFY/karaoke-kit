@@ -1,0 +1,8 @@
+{
+  "_说明": "把 ignoreBracketCommands 加到 config.json 的 socialV2 段里；false = 恢复原行为（【】命令照常唤醒 AI）",
+  "socialV2": {
+    "enabled": true,
+    "ignoreSpamCommands": true,
+    "ignoreBracketCommands": true
+  }
+}
