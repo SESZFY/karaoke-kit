@@ -35,7 +35,29 @@ FFMPEG = os.environ.get("SC_FFMPEG", "ffmpeg")
 VOICE = os.environ.get("SC_VOICE", "luotianyi")
 INTERVAL = float(os.environ.get("SC_INTERVAL", "3"))
 SEEN_FILE = Path(__file__).resolve().parent / "song-cmd-seen.json"
-OWNER = os.environ.get("SC_OWNER", "")   # 必填：你的 QQ 号（用来监听私聊点歌）
+
+
+def guess_owner() -> str:
+    """谁算主人（用来监听私聊点歌）。优先级：SC_OWNER → SurfCore 的 config.json 里的 ownerQQ。
+
+    这样公开仓库里不用写死 QQ 号，装完也能直接用。
+    """
+    env = (os.environ.get("SC_OWNER") or "").strip()
+    if env:
+        return env
+    here = Path(__file__).resolve().parent
+    for cand in (here.parent / "config.json", Path(r"D:\surfcore\config.json")):
+        try:
+            j = json.loads(cand.read_text("utf-8"))
+            v = j.get("ownerQQ")
+            if v:
+                return str(v).strip()
+        except Exception:
+            continue
+    return ""
+
+
+OWNER = guess_owner()   # 可能为空：为空就只监听群，不监听私聊
 
 CMD_RE = re.compile(r"^\s*(?:【\s*唱\s*】|\[\s*唱\s*\]|\[\s*sing\s*\])\s*", re.IGNORECASE)
 
@@ -207,8 +229,6 @@ def handle(ev: dict, token: str) -> None:
 
 
 def main() -> None:
-    if not OWNER:
-        raise SystemExit("请先设置环境变量 SC_OWNER=你的QQ号（用来监听私聊点歌）")
     token = pick_token()
     seen = load_seen()
     log(f"HTTP {HTTP} / song-rvc {SONG} / {'整首' if not SECONDS else f'每首 {SECONDS:.0f}s'} / 每段 {SEGMENT:.0f}s / 轮询 {INTERVAL:.0f}s")
@@ -216,7 +236,10 @@ def main() -> None:
     r = api("get_group_list", {}, token, 20)
     if r.get("status") == "ok":
         groups = [g["group_id"] for g in r.get("data") or []]
-    log(f"监听 {len(groups)} 个群 + 主人私聊 {OWNER}")
+    if OWNER:
+        log(f"监听 {len(groups)} 个群 + 主人私聊 {OWNER}")
+    else:
+        log(f"监听 {len(groups)} 个群（没设 SC_OWNER 也读不到 ownerQQ，私聊不监听）")
     while True:
         try:
             for gid in groups:
@@ -233,18 +256,19 @@ def main() -> None:
                     msg["message_type"] = "group"
                     msg["group_id"] = gid
                     handle(msg, token)
-            h = api("get_friend_msg_history", {"user_id": int(OWNER), "count": 3}, token, 20)
-            if h.get("status") == "ok":
-                for msg in (h.get("data") or {}).get("messages") or []:
-                    mid = msg.get("message_id")
-                    if mid in seen:
-                        continue
-                    if os.environ.get("SC_ALLOW_SELF") != "1" and str((msg.get("sender") or {}).get("user_id")) == str(ev_self_id(token)):
-                        continue
-                    seen.add(mid)
-                    msg["message_type"] = "private"
-                    msg["user_id"] = int(OWNER)
-                    handle(msg, token)
+            if OWNER:
+                h = api("get_friend_msg_history", {"user_id": int(OWNER), "count": 3}, token, 20)
+                if h.get("status") == "ok":
+                    for msg in (h.get("data") or {}).get("messages") or []:
+                        mid = msg.get("message_id")
+                        if mid in seen:
+                            continue
+                        if os.environ.get("SC_ALLOW_SELF") != "1" and str((msg.get("sender") or {}).get("user_id")) == str(ev_self_id(token)):
+                            continue
+                        seen.add(mid)
+                        msg["message_type"] = "private"
+                        msg["user_id"] = int(OWNER)
+                        handle(msg, token)
             save_seen(seen)
         except Exception as e:
             log(f"轮询出错：{type(e).__name__}: {e}")

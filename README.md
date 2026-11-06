@@ -76,11 +76,42 @@ SnowLuma (OneBot HTTP :3000)  ──►  song-cmd-poll.py  (:9883 无，只是�
 
 ## 安装
 
-```powershell
-# 1. 拷文件（默认装到 D:\surfcore\state，可用 -Target 改）
-.\install.ps1 -Target "D:\surfcore\state"
+**一条命令，全自动**（推荐）：
 
-# 2. 设你的 QQ 号（点歌监听要用它来监听私聊）
+```powershell
+.\install.ps1 -Auto
+```
+
+它会自动探测 Coopanion / SurfCore / SnowLuma 路径，拷贝服务脚本，打 4 处补丁（**幂等 + 自动备份**），
+重启 RVC world。装完自检：
+
+```powershell
+.\verify.ps1        # 逐项 PASS/FAIL，最后 OVERALL: PASS
+```
+
+回滚：
+
+```powershell
+.\uninstall.ps1     # 停服务 + 删脚本 + 用 .bak 还原四处补丁
+```
+
+常用参数：
+
+| 参数 | 作用 |
+|---|---|
+| `-DryRun` | 只报告将做什么，不改任何文件 |
+| `-Target <dir>` | 服务目录（默认 `<SurfCore>\state`） |
+| `-CoopanionPath` / `-SurfcorePath` | 手动指定路径 |
+| `-SkipSurfcore` / `-SkipCoopanion` | 跳过某块补丁 |
+| `-Start` | 装完直接起服务 |
+
+**手动安装**（想一步步来）：
+
+```powershell
+# 1. 拷文件
+.\install.ps1 -Target "D:\surfcore\state" -SkipSurfcore -SkipCoopanion
+
+# 2. 设 QQ 号（也可不设：会从 SurfCore config.json 的 ownerQQ 自动读）
 setx SC_OWNER "你的QQ号"
 
 # 3. 起服务
@@ -88,16 +119,25 @@ cd <Target>
 powershell -ExecutionPolicy Bypass -File music-plugin.ps1 start
 ```
 
-SurfCore 那两块手动改（它是别人项目的源码，不方便自动替换）：
+**四处补丁分别是什么**（`install.ps1 -Auto` 会全部自动做掉）：
 
-1. `surfcore-patch/command-spam.js` → 覆盖 `你的surfcore\src\command-spam.js`
-2. `surfcore-patch/bridge-insert.md` 里那 8 行 → 插到 `src/bridge.js` 的指定位置
-3. `config.json` 的 `socialV2` 加一行 `"ignoreBracketCommands": true`
-4. 重启桥接（用 `surfcore-patch/restart.bat`）
+| # | 文件 | 改什么 |
+|---|---|---|
+| 1 | `<SurfCore>\src\command-spam.js` | 加 `isBracketCommandText`（整个文件替换） |
+| 2 | `<SurfCore>\src\bridge.js` | 改 import + 插 12 行过滤块（按 anchor 定位，插完即止） |
+| 3 | `<SurfCore>\config.json` | `socialV2.ignoreBracketCommands = true`（文本插入，保留缩进） |
+| 4 | `<RVC扩展>\src\python\worker.py` | 加 `_release_vram`（整个文件替换），然后重启 RVC world |
 
-Coopanion 那块：`coopanion-patch/worker.py` 覆盖
-`Coopanion\data\extensions\node_modules\@wocwang\cortico-world-rvc-for-coopanion\src\python\worker.py`，
-然后在 Coopanion 里重启 RVC world（或调 `POST /api/worlds/restart {"id":"rvc"}`）。
+每处改前都会备份成 `<文件名>.bak-<yyyyMMdd-HHmmss>`。
+
+---
+
+## 交给 AI 代理全自动安装
+
+仓库根目录有 **`AGENTS.md`** —— 一份写给 DSH / Claude / Codex 这类代理的操作手册：
+环境探测表、安装命令、验证清单、四处补丁的精确位置、排障对照表、修改规范（幂等 / 备份 / 只碰这 4 个文件 / 不提交密钥）。
+
+把仓库丢给代理，它读 `AGENTS.md` 就能自己装完并跑 `verify.ps1` 验收。
 
 ---
 

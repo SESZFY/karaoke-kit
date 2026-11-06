@@ -1,4 +1,4 @@
-# 点歌服务守护 —— 守 song-rvc(:9883)、点歌监听，以及 Coopanion 那边的 RVC 引擎(:9881)。
+﻿# 点歌服务守护 —— 守 song-rvc(:9883)、点歌监听，以及 Coopanion 那边的 RVC 引擎(:9881)。
 #
 # 旧 song-rvc-guard.bat 的判定是坏的：
 #   tasklist /FI "IMAGENAME eq python.exe" /FO CSV | findstr "song-rvc"

@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][string]$Repo,    # 你的仓库，例如 yourname/karaoke-kit
     [Parameter(Mandatory = $true)][string]$Token,   # GitHub Personal Access Token（scope: repo）
     [string]$Branch = "main",
