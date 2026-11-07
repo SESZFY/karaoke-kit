@@ -43,6 +43,66 @@ def _is_foreign_tools(path: str, root: str) -> bool:
         return False
 
 
+def _pitch_shift_np(x, sr: int, n_steps: int):
+    """给伴奏整体移调（半音）。保持时长不变，只改音高。"""
+    import numpy as np
+    if not n_steps:
+        return x
+    try:
+        import torch
+        import torchaudio
+        t = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32))
+        out = torchaudio.functional.pitch_shift(t, sr, float(n_steps))
+        return out.numpy().astype(np.float32)
+    except Exception as error:
+        print("[rvc] 伴奏移调失败（原调混音）：%s" % error, file=sys.stderr)
+        return x
+
+class DemucsSeparator:
+    """htdemucs 人声分离（GPU）。比 MDX-Net 干净得多，代价是慢一些、吃 2~3G 显存。
+
+    和 MdxSeparator 接口一致：separate((2,N) float32) -> (vocals, instrumental)。
+    htdemucs 输出 4 条 stem：drums / bass / other / vocals，人声取第 4 条，
+    伴奏 = 另外三条相加。这比 "mix - inst" 反相相减稳得多——不会把古筝、
+    弦乐、合成器残留漏进人声里被 RVC 唱成怪叫。
+    """
+
+    name = "demucs"
+
+    def __init__(self, repo: str = "htdemucs"):
+        import os as _os
+        # 模型已经在本地缓存；不设这两个，huggingface_hub 每次都要联网查更新，
+        # 实测能卡 169 秒然后超时 —— worker 等不及就回退 MDX 了。
+        _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        import torch
+        from demucs.pretrained import get_model
+
+        self.torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = get_model(repo)
+        self.model.eval()
+        self.model.to(self.device)
+
+    def separate(self, mix):
+        import numpy as np
+        from demucs.apply import apply_model
+
+        t = self.torch
+        wav = t.from_numpy(np.ascontiguousarray(mix)).float()
+        ref = wav.mean(0)
+        mean = float(ref.mean())
+        std = float(ref.std()) + 1e-8
+        inp = ((wav - mean) / std)[None]
+        with t.no_grad():
+            out = apply_model(self.model, inp, device=self.device, shifts=1,
+                              split=True, overlap=0.25, progress=False)[0]
+        out = out * std + mean
+        vocals = out[3]
+        instrumental = out[0] + out[1] + out[2]
+        return (vocals.cpu().numpy().astype(np.float32),
+                instrumental.cpu().numpy().astype(np.float32))
+
 def main() -> int:
     if len(sys.argv) < 4:
         print("usage: worker.py <codeDir> <voicesDir> <assetsDir>", file=sys.stderr)
@@ -194,7 +254,7 @@ def main() -> int:
     CHUNK_SECONDS = 20.0
     OVERLAP_SECONDS = 0.3
 
-    def run_vc(path: str, pitch: int, index_rate: float, protect: float, chunked: bool = True):
+    def run_vc(path: str, pitch: int, index_rate: float, protect: float, chunked: bool = True, rms_mix: float = 0.25):
         """整段或分段跑 RVC，返回 (sampleRate, int16 波形)。
 
         分段时按**绝对时间轴**摆放每一片：每片输出先裁/补到它应有的长度，再叠进总缓冲，
@@ -207,7 +267,7 @@ def main() -> int:
         audio = load_audio(path, 16000)
         chunk = int(CHUNK_SECONDS * 16000)
         if not chunked or len(audio) <= chunk:
-            return vc.vc_single(0, path, pitch, "rmvpe", current["index"], index_rate, 0, 1.0, protect)
+            return vc.vc_single(0, path, pitch, "rmvpe", current["index"], index_rate, 0, rms_mix, protect)
 
         overlap = int(OVERLAP_SECONDS * 16000)
         global_peak = float(np.abs(audio).max()) or 1.0
@@ -224,7 +284,7 @@ def main() -> int:
                 segment = audio[start:end]
                 sf.write(tmp, segment, 16000, subtype="FLOAT")
                 print("[rvc] 切片 %d/%d：%.1f 秒" % (index, total_chunks, len(segment) / 16000.0), file=sys.stderr)
-                status, result = vc.vc_single(0, tmp, pitch, "rmvpe", current["index"], index_rate, 0, 1.0, protect)
+                status, result = vc.vc_single(0, tmp, pitch, "rmvpe", current["index"], index_rate, 0, rms_mix, protect)
                 if not result or result[0] is None or result[1] is None:
                     return status, None
                 sample_rate = int(result[0])
@@ -291,10 +351,30 @@ def main() -> int:
                 sys.path.insert(0, purelib)
         except Exception:
             pass
+        wants = (os.environ.get("RVC_SEPARATOR") or "demucs").strip().lower()
+        if wants in ("demucs", "htdemucs", "auto"):
+            try:
+                separation["model"] = DemucsSeparator()
+                print("[rvc] 分离器 Demucs htdemucs（%s）" % separation["model"].device, file=sys.stderr)
+                try:
+                    open(r"D:\Coopanion\data\tmp\rvc-sep.log", "a", encoding="utf-8").write("[%s] Demucs %s\n" % (time.strftime("%H:%M:%S"), separation["model"].device))
+                except Exception:
+                    pass
+                return separation["model"]
+            except Exception as _err:
+                print("[rvc] Demucs 不可用，回退 MDX：%s" % _err, file=sys.stderr)
+                try:
+                    open(r"D:\Coopanion\data\tmp\rvc-sep.log", "a", encoding="utf-8").write("[%s] Demucs FAILED: %s\n" % (time.strftime("%H:%M:%S"), str(_err)[:200]))
+                except Exception:
+                    pass
         from mdx import MdxSeparator
 
         separation["model"] = MdxSeparator(uvr_model)
         print("[rvc] 人声分离模型已载入 %s（%s）" % (uvr_model, getattr(separation["model"], "provider", "CPU")), file=sys.stderr)
+        try:
+            open(r"D:\Coopanion\data\tmp\rvc-sep.log", "a", encoding="utf-8").write("[%s] MDX %s\n" % (time.strftime("%H:%M:%S"), uvr_model))
+        except Exception:
+            pass
         return separation["model"]
 
     def load_song(path: str):
@@ -367,6 +447,7 @@ def main() -> int:
                 float(req.get("indexRate", 0.3)),
                 float(req.get("protect", 0.33)),
                 bool(req.get("chunk", 1)),
+                float(req.get("rmsMix", 0.25)),
             )
         except Exception:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-1500:]})
@@ -407,6 +488,9 @@ def main() -> int:
         began = time.time()
         try:
             vocals, instrumental = sep.separate(mix)
+            if DOUBLE_SEP and getattr(sep, "name", "") != "demucs":
+                vocals = _second_pass(sep, vocals)
+            vocals = _clean_vocals(vocals)
         except Exception:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-1500:]})
             return
@@ -425,6 +509,9 @@ def main() -> int:
             return
         emit({"type": "result", "id": req_id, "ok": True, "ms": int((time.time() - began) * 1000), "sampleRate": 44100})
 
+    # 人声二次分离：专治"伴奏漏进人声被 RVC 唱成怪叫"（前奏尤其明显）
+    DOUBLE_SEP = os.environ.get("RVC_DOUBLE_SEP", "1") == "1"
+
     def _release_vram() -> None:
         """任务收工把未使用的显存还给驱动。
 
@@ -440,6 +527,85 @@ def main() -> int:
         except Exception:
             pass
 
+    def _vocal_gate(vocals, n_samples: int, sr: int = 44100, thr_db: float = -42.0):
+        """用**原始人声**的帧能量做掩码，压掉 RVC 在静音/弱音段凭空造出来的杂音。
+
+        RVC 在没人声的地方（前奏、间奏、尾奏）f0 提不准，模型会输出呼吸声、
+        电音、咕噜声——这就是"全曲莫名其妙的杂音"。转换后按原始人声的能量
+        逐帧乘一个 0..1 的增益，静音段直接归零，弱音段平滑过渡 12 dB。
+        """
+        import numpy as np
+        hop = max(1, int(sr * 0.02))
+        frames = n_samples // hop
+        if frames < 4 or vocals.size == 0:
+            return None
+        src = np.asarray(vocals, dtype=np.float32)
+        src = src[:, :frames * hop].reshape(src.shape[0], frames, hop)
+        rms = np.sqrt(np.mean(src ** 2, axis=2)).mean(axis=0)
+        db = 20 * np.log10(np.maximum(rms, 1e-9))
+        g = np.clip((db - thr_db) / 12.0, 0.0, 1.0).astype(np.float32)
+        k = np.ones(5, dtype=np.float32) / 5.0
+        g = np.convolve(g, k, mode="same").astype(np.float32)
+        return np.repeat(g, hop)
+    def _second_pass(sep, vocals):
+        """人声轨二次分离：把第一次没分干净的伴奏残留再减一遍。
+
+        `UVR-MDX-NET-Inst_HQ_3` 只输出伴奏，人声靠 `mix - inst` 反相相减。
+        古筝、弦乐、合成器这类音色和人声重叠严重的乐器会漏进人声轨，
+        RVC 就会把它们当成人声去"唱"——听起来就是前奏里的怪叫。
+
+        这里把拿到的人声轨再送去分离一次，取第二次的人声输出。
+        二次分离会掉电平，按前后 RMS 补一半回来（全补会把残留也放大）。
+        """
+        import numpy as np
+        try:
+            before = float(np.sqrt(np.mean(vocals ** 2)))
+            again, _ = sep.separate(vocals)
+            after = float(np.sqrt(np.mean(again ** 2)))
+            if before > 1e-6 and after > 1e-6:
+                again = again * ((before / after) ** 0.5)
+            return again
+        except Exception as error:
+            print("[rvc] 二次分离失败，用第一次结果：%s" % error, file=sys.stderr)
+            return vocals
+    def _clean_vocals(vocals, sr: int = 44100):
+        """人声轨后处理，专治「伴奏漏进人声、被 RVC 唱成鬼叫」。
+
+        `UVR-MDX-NET-Inst_HQ_3` 输出的是**伴奏**，人声靠 mix - inst 反相相减拿到。
+        贝斯、底鼓、低频合成器这类容易漏进来，进了 RVC 就会被当成人声去转换，
+        听起来就是鬼叫。这里做两件事：
+
+          1. 75 Hz 二阶高通 —— 削掉低频乐器残留（男低音基频最低约 82 Hz，75 是安全线）
+          2. 20 ms 帧能量门限 —— 人声几乎不存在的段压到 -24 dB，
+             减少 RVC 在纯伴奏段"乱唱"
+
+        门限取 -46 dBFS 比较保守（只压真正的静音段），不会吃掉气声和尾音。
+        """
+        import numpy as np
+        from scipy.signal import butter, sosfilt
+
+        x = np.asarray(vocals, dtype=np.float32)
+        if x.ndim == 1:
+            x = x[None, :]
+        if x.size == 0:
+            return vocals
+
+        sos = butter(2, 75.0, btype="highpass", fs=sr, output="sos")
+        x = sosfilt(sos, x, axis=1).astype(np.float32)
+
+        hop = max(1, int(sr * 0.02))
+        frames = x.shape[1] // hop
+        if frames > 4:
+            rms = np.sqrt(np.mean(x[:, :frames * hop].reshape(x.shape[0], frames, hop) ** 2, axis=2))
+            frame_db = 20 * np.log10(np.maximum(rms, 1e-9))
+            gain = np.where(frame_db < -46.0, 0.06, 1.0).astype(np.float32)
+            k = np.ones(5, dtype=np.float32) / 5.0
+            gain = np.apply_along_axis(lambda g: np.convolve(g, k, mode="same"), 1, gain).astype(np.float32)
+            for ch in range(x.shape[0]):
+                g = np.repeat(gain[ch], hop)
+                span = g.size
+                x[ch, :span] = x[ch, :span] * g
+        return x
     def cover(req: dict) -> None:
         """整首歌：分离人声/伴奏 → 人声变声 → 混回整首。"""
         import numpy as np
@@ -473,6 +639,9 @@ def main() -> int:
         began = time.time()
         try:
             vocals, instrumental = sep.separate(mix)
+            if DOUBLE_SEP and getattr(sep, "name", "") != "demucs":
+                vocals = _second_pass(sep, vocals)
+            vocals = _clean_vocals(vocals)
         except Exception:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "分离失败：%s" % traceback.format_exc()[-1500:]})
             return
@@ -488,13 +657,15 @@ def main() -> int:
             return
 
         convert_began = time.time()
+        key_shift = int(req.get("keyShift") or 0)
         try:
             result = run_vc(
                 vocal_path,
-                int(req.get("pitch") or 0),
+                int(req.get("pitch") or 0) + key_shift,
                 float(req.get("indexRate", 0.3)),
                 float(req.get("protect", 0.33)),
                 bool(req.get("chunk", 1)),
+                float(req.get("rmsMix", 0.25)),
             )
         except Exception:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-1500:]})
@@ -516,8 +687,15 @@ def main() -> int:
             # RVC 回的是 int16（已归一到约 0.99 峰值）；换成 float 才能和人声/伴奏相加。
             conv = conv.astype(np.float32) / 32768.0 if conv.dtype.kind in "iu" else conv.astype(np.float32)
             conv = resample_to_44100(conv, conv_sr)
+            if key_shift:
+                instrumental = _pitch_shift_np(instrumental, 44100, key_shift)
+                print("[rvc] 伴奏移调 %+d 半音" % key_shift, file=sys.stderr)
             n = instrumental.shape[1]
             conv = conv[:n] if conv.size >= n else np.pad(conv, (0, n - conv.size))
+            _vmask = _vocal_gate(vocals, n)
+            if _vmask is not None:
+                _m = _vmask[:_vmask.size]
+                conv[: _m.size] = conv[: _m.size] * _m
             # 电平对齐：RVC 输出被峰值归一化过，直接叠会盖过伴奏；按原人声的 RMS 比例把音量拉回来。
             rms_vocal = float(np.sqrt(np.mean(vocals ** 2)))
             rms_conv = float(np.sqrt(np.mean(conv ** 2)))

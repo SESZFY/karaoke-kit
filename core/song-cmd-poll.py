@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 song-cmd-poll —— 轮询版「QQ 里发【唱】歌名就回语音」。不依赖 WebSocket。
 
@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-CONF = Path(os.environ.get("SC_ONEBOT_CONF") or r"D:\大肥鱼的实验室\SnowLuma\config")
+CONF = Path(r"D:\大肥鱼的实验室\SnowLuma\config")
 HTTP = os.environ.get("SC_HTTP", "http://127.0.0.1:3000").rstrip("/")
 SONG = os.environ.get("SC_SONG", "http://127.0.0.1:9883").rstrip("/")
 SECONDS = float(os.environ.get("SC_SECONDS", "0"))      # 0 = 整首（分段发全曲）；填数字则只唱那么多秒
@@ -35,29 +35,7 @@ FFMPEG = os.environ.get("SC_FFMPEG", "ffmpeg")
 VOICE = os.environ.get("SC_VOICE", "luotianyi")
 INTERVAL = float(os.environ.get("SC_INTERVAL", "3"))
 SEEN_FILE = Path(__file__).resolve().parent / "song-cmd-seen.json"
-
-
-def guess_owner() -> str:
-    """谁算主人（用来监听私聊点歌）。优先级：SC_OWNER → SurfCore 的 config.json 里的 ownerQQ。
-
-    这样公开仓库里不用写死 QQ 号，装完也能直接用。
-    """
-    env = (os.environ.get("SC_OWNER") or "").strip()
-    if env:
-        return env
-    here = Path(__file__).resolve().parent
-    for cand in (here.parent / "config.json", Path(r"D:\surfcore\config.json")):
-        try:
-            j = json.loads(cand.read_text("utf-8"))
-            v = j.get("ownerQQ")
-            if v:
-                return str(v).strip()
-        except Exception:
-            continue
-    return ""
-
-
-OWNER = guess_owner()   # 可能为空：为空就只监听群，不监听私聊
+OWNER = os.environ.get("SC_OWNER", "3147159492")
 
 CMD_RE = re.compile(r"^\s*(?:【\s*唱\s*】|\[\s*唱\s*\]|\[\s*sing\s*\])\s*", re.IGNORECASE)
 
@@ -236,10 +214,7 @@ def main() -> None:
     r = api("get_group_list", {}, token, 20)
     if r.get("status") == "ok":
         groups = [g["group_id"] for g in r.get("data") or []]
-    if OWNER:
-        log(f"监听 {len(groups)} 个群 + 主人私聊 {OWNER}")
-    else:
-        log(f"监听 {len(groups)} 个群（没设 SC_OWNER 也读不到 ownerQQ，私聊不监听）")
+    log(f"监听 {len(groups)} 个群 + 主人私聊 {OWNER}")
     while True:
         try:
             for gid in groups:
@@ -256,19 +231,18 @@ def main() -> None:
                     msg["message_type"] = "group"
                     msg["group_id"] = gid
                     handle(msg, token)
-            if OWNER:
-                h = api("get_friend_msg_history", {"user_id": int(OWNER), "count": 3}, token, 20)
-                if h.get("status") == "ok":
-                    for msg in (h.get("data") or {}).get("messages") or []:
-                        mid = msg.get("message_id")
-                        if mid in seen:
-                            continue
-                        if os.environ.get("SC_ALLOW_SELF") != "1" and str((msg.get("sender") or {}).get("user_id")) == str(ev_self_id(token)):
-                            continue
-                        seen.add(mid)
-                        msg["message_type"] = "private"
-                        msg["user_id"] = int(OWNER)
-                        handle(msg, token)
+            h = api("get_friend_msg_history", {"user_id": int(OWNER), "count": 3}, token, 20)
+            if h.get("status") == "ok":
+                for msg in (h.get("data") or {}).get("messages") or []:
+                    mid = msg.get("message_id")
+                    if mid in seen:
+                        continue
+                    if os.environ.get("SC_ALLOW_SELF") != "1" and str((msg.get("sender") or {}).get("user_id")) == str(ev_self_id(token)):
+                        continue
+                    seen.add(mid)
+                    msg["message_type"] = "private"
+                    msg["user_id"] = int(OWNER)
+                    handle(msg, token)
             save_seen(seen)
         except Exception as e:
             log(f"轮询出错：{type(e).__name__}: {e}")

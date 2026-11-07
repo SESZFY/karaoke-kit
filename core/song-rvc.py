@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 song-rvc —— 「唱某首歌」：搜音源 → 下载 → RVC 换成本机音色 → 返回音频。
 
@@ -49,7 +49,29 @@ YTDLP = os.environ.get("SONG_RVC_YTDLP", "yt-dlp")
 FFMPEG = os.environ.get("SONG_RVC_FFMPEG", "ffmpeg")
 # 整首翻唱混音时的人声增益(dB)。UVR5 分出来的伴奏保留了原曲母带响度，而 RVC 出来的是干声，
 # 按 RMS 对齐后叠上去人声会发闷发小。默认 +5dB；还嫌小就 SONG_RVC_VOCAL_GAIN=7 再跑。
-VOCAL_GAIN = float(os.environ.get("SONG_RVC_VOCAL_GAIN", "5"))
+VOCAL_GAIN = float(os.environ.get("SONG_RVC_VOCAL_GAIN", "3.5"))
+# 音域适配：# protect 越高越能保住清辅音/气声，减少高音区的破音和齿音拉丝
+PROTECT = float(os.environ.get("SONG_RVC_PROTECT", "0.5"))
+# 响度包络混合：1.0 = 完全用转换后的包络（高音容易突然冲出来），0.25 更贴原唱动态
+RMS_MIX = float(os.environ.get("SONG_RVC_RMS_MIX", "0.25"))
+# 索引率 0..1：越高越贴音色，但高音区检索容易串味、发刺。点歌默认压到 0.2
+INDEX_RATE = float(os.environ.get("SONG_RVC_INDEX_RATE", "0.1"))
+# 变调（半音）：+12 = 升八度，-12 = 降八度。0 为原调。
+# 升八度相当于让模型用更低的发声位置去唱，极高音会轻松很多；八度是和谐音程，
+# 所以人声升八度和原调伴奏叠在一起还能听（不像升 5 个半音那么怪）。
+PITCH = int(os.environ.get("SONG_RVC_PITCH", "0"))
+
+# ── 演唱引擎 ────────────────────────────────────────────
+# ddsp = DDSP-SVC ReFlow（音质好、快），rvc = 老的 RVC /cover 链路（可随时切回）
+ENGINE = os.environ.get("SONG_ENGINE", "ddsp").strip().lower()
+DDSP_DIR = os.environ.get("SONG_DDSP_DIR", r"D:\surfcore\state\ddsp-svc")
+DDSP_PY = os.environ.get("SONG_DDSP_PY", r"D:\Coopanion\data\home\companion\data\rvc\venv\Scripts\python.exe")
+DDSP_STEP = int(os.environ.get("DDSP_STEP", "40"))
+DDSP_HIGHPASS = float(os.environ.get("DDSP_HIGHPASS", "380"))
+# 高音柔化：deesser 压齿音 + 7kHz 以上轻降，专治高音"尖/刺/炸"
+HIGH_SOFTEN = os.environ.get("SONG_RVC_SOFTEN", "1") == "1"
+DEESS_I = float(os.environ.get("SONG_RVC_DEESS", "0.65"))
+HIGH_SHELF_DB = float(os.environ.get("SONG_RVC_HIGHSHELF_DB", "-2"))
 # 磁盘策略：默认不留原音源和成品（一首歌的原 wav 就 40~50MB，攒几十首就是几个 G）。
 # SONG_RVC_KEEP=1 才保留（重复点同一首能跳过下载，但会一直占地）。
 KEEP_CACHE = os.environ.get("SONG_RVC_KEEP", "1") == "1"
@@ -353,7 +375,7 @@ def clip(src: Path, dst: Path, start: float, seconds: float) -> Path:
 DEFAULT_VOICE = os.environ.get("SONG_RVC_VOICE", "luotianyi")
 
 
-def rvc_convert(src: Path, voice: str, separator: bool) -> bytes:
+def rvc_convert(src: Path, voice: str, separator: bool, key_shift: int = 0) -> bytes:
     """调本机 RVC 插件换音色，返回 wav 字节。"""
     boundary = "----songrvc" + uuid.uuid4().hex
     body = bytearray()
@@ -372,6 +394,13 @@ def rvc_convert(src: Path, voice: str, separator: bool) -> bytes:
     if separator:
         # 整首翻唱走 /cover，混音阶段能调人声电平（-12..12 dB，插件侧字段名 vocalGain）
         field("vocalGain", f"{VOCAL_GAIN:g}")
+    # 音域适配：保护清辅音 + 响度包络贴近原唱（高音不炸、低音不虚）
+    if key_shift:
+        field("keyShift", str(key_shift))
+    field("pitch", str(PITCH))
+    field("indexRate", f"{INDEX_RATE:g}")
+    field("protect", f"{PROTECT:g}")
+    field("rmsMix", f"{RMS_MIX:g}")
     field("format", "wav")
     body.extend(f"--{boundary}--\r\n".encode())
 
@@ -388,6 +417,108 @@ def rvc_convert(src: Path, voice: str, separator: bool) -> bytes:
         raise RuntimeError(f"RVC 不可用：{e}")
 
 
+def estimate_key_shift(src: Path, max_sec: float = 90.0) -> int:
+    """看原曲音域是否超出音色模型的舒适区，决定整首升/降八度。
+
+    女声模型（luotianyi）的舒适基频大约 150~800 Hz：
+      · 95% 分位的 f0 超过 900 Hz —— 极高音上不去、容易刺 -> 整首降八度（-12）
+      · 5% 分位低于 90 Hz —— 极低音下不来、发虚 -> 整首升八度（+12）
+
+    只动八度、不动半音：八度是和谐音程；worker 那边会把**伴奏一起移调**，
+    所以整首歌是真的换了 key，不是人声跑调。
+    """
+    if os.environ.get("SONG_RVC_AUTO_KEY", "1") != "1":
+        return 0
+    try:
+        import librosa
+        import numpy as np
+    except Exception as e:
+        log(f"音域检测跳过（缺 librosa）：{e}")
+        return 0
+    try:
+        y, sr = librosa.load(str(src), sr=22050, mono=True, duration=max_sec)
+        # 先高通 120 Hz：混音里的贝斯/底鼓会被 pyin 误判成 70 Hz 的"极低音"，
+        # 一上来就把整首升八度（实测《左手指月》就被这样带偏过）。
+        try:
+            import scipy.signal as _ss
+            _sos = _ss.butter(4, 120.0, "highpass", fs=sr, output="sos")
+            y = _ss.sosfilt(_sos, y).astype("float32")
+        except Exception:
+            pass
+        f0, _, _ = librosa.pyin(y, fmin=110.0, fmax=1200.0, sr=sr,
+                                frame_length=2048, hop_length=256)
+        vals = f0[~np.isnan(f0)]
+        if vals.size < 200:
+            log("音域检测：有效音高太少，保持原调")
+            return 0
+        lo = float(np.percentile(vals, 5))
+        hi = float(np.percentile(vals, 95))
+        log(f"音域检测：f0 5%={lo:.0f}Hz  95%={hi:.0f}Hz")
+        if hi > float(os.environ.get("SONG_RVC_KEY_HI", "800")):
+            log("极高音超出模型舒适区 -> 整首降八度（伴奏同步）")
+            return -12
+        if lo < float(os.environ.get("SONG_RVC_KEY_LO", "110")):
+            log("极低音超出模型舒适区 -> 整首升八度（伴奏同步）")
+            return 12
+        return 0
+    except Exception as e:
+        log(f"音域检测失败：{e}")
+        return 0
+
+def soften_highs(data: bytes) -> bytes:
+    """高音柔化：消齿音 + 7 kHz 以上轻降。
+
+    RVC 在高音区最容易把齿音（s/sh/ts）和气声放大成"尖"，甚至发炸。
+    deesser 是专门压这个的滤镜；highshelf 再补一点衰减，整体听感就不刺了。
+    失败就原样返回，绝不让它拖垮出歌。
+    """
+    if not HIGH_SOFTEN or len(data) < 5000:
+        return data
+    try:
+        af = (f"deesser=i={DEESS_I:g}:m=0.6:f=0.55,"
+              f"highshelf=f=7000:g={HIGH_SHELF_DB:g}")
+        p = subprocess.run(
+            [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+             "-i", "pipe:0", "-af", af,
+             "-f", "wav", "-c:a", "pcm_s16le", "pipe:1"],
+            input=data, capture_output=True, timeout=600)
+        if p.returncode == 0 and len(p.stdout) > 5000:
+            return p.stdout
+        log(f"高音柔化失败，用原音：{(p.stderr or b'')[:120]!r}")
+    except Exception as e:
+        log(f"高音柔化异常：{e}")
+    return data
+
+def ddsp_convert(src: Path, key_shift: int = 0) -> bytes:
+    """走 DDSP-SVC 流水线：Demucs 分离 -> 380Hz 高通 -> 音高掩码 -> ReFlow -> 混音母带。
+
+    跑在 Coopanion 的 RVC venv 里（那份有 torch cu128 / demucs / ddsp 依赖）。
+    整首一次处理，不碎成片段，所以不会有分片接缝。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="ddspcall-"))
+    try:
+        out = tmp / "out.wav"
+        script = Path(DDSP_DIR) / "ddsp_sing.py"
+        if not script.exists():
+            raise RuntimeError(f"找不到 DDSP 流水线脚本：{script}")
+        cmd = [
+            DDSP_PY, str(script),
+            "--input", str(src),
+            "--output", str(out),
+            "--workdir", str(tmp / "work"),
+            "--step", str(DDSP_STEP),
+            "--highpass", f"{DDSP_HIGHPASS:g}",
+            "--key", str(key_shift),
+        ]
+        t0 = time.time()
+        p = subprocess.run(cmd, cwd=DDSP_DIR, capture_output=True, text=True, timeout=3600)
+        if p.returncode != 0 or not out.exists():
+            raise RuntimeError(f"DDSP 流水线失败：{(p.stderr or '')[-500:]}")
+        log(f"DDSP 出歌完成 {time.time()-t0:.1f}s  {out.stat().st_size/1024/1024:.1f}MB")
+        return out.read_bytes()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def duration_of(path: Path) -> float:
     """读时长（秒）。源文件是 PCM wav，直接读头；读不到再退回 ffprobe；都没有就返回 0。"""
     try:
@@ -403,7 +534,7 @@ def duration_of(path: Path) -> float:
         return 0.0
 
 
-def rvc_convert_blocks(src: Path, voice: str, separator: bool) -> bytes:
+def rvc_convert_blocks(src: Path, voice: str, separator: bool, key_shift: int = 0) -> bytes:
     """长音频分块跑 RVC 再把各块拼回一条。
 
     一次性整首交给 /cover 时，插件会把音频切成十几片在 GPU 上连着跑，8G 显存
@@ -412,7 +543,7 @@ def rvc_convert_blocks(src: Path, voice: str, separator: bool) -> bytes:
     """
     total = duration_of(src)
     if not BLOCK_SECONDS or BLOCK_SECONDS <= 0 or total <= BLOCK_SECONDS * 1.15:
-        return rvc_convert(src, voice, separator)
+        return rvc_convert(src, voice, separator, key_shift)
     tmp = Path(tempfile.mkdtemp(prefix="rvcblk-"))
     try:
         chunks: list[bytes] = []
@@ -422,10 +553,10 @@ def rvc_convert_blocks(src: Path, voice: str, separator: bool) -> bytes:
             clip(src, seg, t, BLOCK_SECONDS)
             if seg.exists() and seg.stat().st_size > 1000:
                 log(f"分块 {len(chunks) + 1}：{t:.0f}s 起 {min(BLOCK_SECONDS, total - t):.0f}s / 共 {total:.0f}s")
-                chunks.append(rvc_convert(seg, voice, separator))
+                chunks.append(rvc_convert(seg, voice, separator, key_shift))
             t += BLOCK_SECONDS
         if not chunks:
-            return rvc_convert(src, voice, separator)
+            return rvc_convert(src, voice, separator, key_shift)
         if len(chunks) == 1:
             return chunks[0]
         first = wave.open(io.BytesIO(chunks[0]), "rb")
@@ -519,7 +650,16 @@ def _sing_song_impl(query: str, voice: str = "", max_seconds: float = 60.0,
         work = clip(src, CACHE / f"{key}.seg.wav", st, max_seconds)
         log(f"截取 {st:.0f}s 起 {max_seconds:.0f}s")
 
-    audio = rvc_convert_blocks(work, (voice or "").strip() or DEFAULT_VOICE, separator)
+    if ENGINE == "ddsp":
+        # DDSP 链路自己会做分离/高通/混音/母带，不再走 RVC 那套
+        log("引擎：DDSP-SVC（Demucs 分离 + Reflow 转换）")
+        audio = ddsp_convert(work, 0)
+    else:
+        key_shift = estimate_key_shift(src)
+        if key_shift:
+            log(f"整首移调 {key_shift:+d} 半音（人声和伴奏一起）")
+        audio = rvc_convert_blocks(work, (voice or "").strip() or DEFAULT_VOICE, separator, key_shift)
+        audio = soften_highs(audio)
     if len(audio) < 5000:
         raise RuntimeError(f"RVC 回了空音频：{audio[:200]!r}")
     CACHE.mkdir(parents=True, exist_ok=True)

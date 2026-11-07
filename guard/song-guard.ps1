@@ -7,11 +7,7 @@
 # 表现就是点歌时好时坏、日志里莫名其妙出现 10061/10054。
 # 这里改成按命令行匹配，只有一个实例才放行。
 
-# 服务目录（song-rvc.py / song-cmd-poll.py 所在处）。可用 SC_STATE_DIR 覆盖。
-$STATE = if ($env:SC_STATE_DIR) { $env:SC_STATE_DIR } else { 'D:\surfcore\state' }
-# Coopanion 的 RVC 引擎端口 / webui 端口（自愈用）
-$RVC_PORT = if ($env:SC_RVC_PORT) { $env:SC_RVC_PORT } else { '9881' }
-$COOPANION_WEBUI = if ($env:SC_COOPANION_WEBUI) { $env:SC_COOPANION_WEBUI } else { 'http://127.0.0.1:17788' }
+$STATE = 'D:\surfcore\state'
 
 function Get-Match([string]$pattern) {
     @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
@@ -19,7 +15,11 @@ function Get-Match([string]$pattern) {
 }
 
 function Start-Hidden([string]$script, [string]$outLog, [string]$errLog) {
-    cmd.exe /c "start `"$script`" /B python `"$STATE\$script`" >> `"$STATE\$outLog`" 2>> `"$STATE\$errLog`""
+    # 不要用 cmd /c start /B：进程会挂在守护那个隐藏窗口的控制台上，
+    # 控制台一销毁（守护被关、会话结束）子进程就跟着没了 —— 表现就是「song-rvc 没开」。
+    # 这里让 cmd 常驻当父进程（重定向要 shell），窗口隐藏，日志 append。
+    $args2 = '/c python "' + (Join-Path $STATE $script) + '" >> "' + (Join-Path $STATE $outLog) + '" 2>> "' + (Join-Path $STATE $errLog) + '"'
+    Start-Process -FilePath 'cmd.exe' -ArgumentList $args2 -WorkingDirectory $STATE -WindowStyle Hidden | Out-Null
 }
 
 # RVC 引擎（Coopanion 的 world）崩了：worker 一退出，9881 就 ready=false，所有点歌 409。
@@ -29,14 +29,14 @@ $script:lastRvcRestart = [datetime]::MinValue
 
 function Test-RvcReady {
     try {
-        $h = (Invoke-WebRequest "http://127.0.0.1:$RVC_PORT/health" -TimeoutSec 4 -UseBasicParsing).Content | ConvertFrom-Json
+        $h = (Invoke-WebRequest 'http://127.0.0.1:9881/health' -TimeoutSec 4 -UseBasicParsing).Content | ConvertFrom-Json
         return [bool]$h.ready
     } catch { return $false }
 }
 
 function Restart-RvcEngine {
     try {
-        $r = Invoke-WebRequest "$COOPANION_WEBUI/api/worlds/restart" -Method POST `
+        $r = Invoke-WebRequest 'http://127.0.0.1:17788/api/worlds/restart' -Method POST `
             -Body '{"id":"rvc"}' -ContentType 'application/json' -TimeoutSec 15 -UseBasicParsing
         Write-Host "$(Get-Date -Format HH:mm:ss) RVC 引擎不在，已请求重启：$($r.Content)"
         $script:lastRvcRestart = Get-Date

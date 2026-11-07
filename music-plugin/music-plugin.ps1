@@ -12,7 +12,7 @@
 param([string]$Action = 'status')
 
 $ErrorActionPreference = 'Continue'
-$STATE = if ($env:SC_STATE_DIR) { $env:SC_STATE_DIR } else { 'D:\surfcore\state' }
+$STATE = 'D:\surfcore\state'
 $PY = 'python'
 
 function Test-Port([int]$p) {

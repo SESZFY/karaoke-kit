@@ -1,126 +1,112 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    QQ 点歌翻唱套件 —— 卸载 / 回滚
-
-.DESCRIPTION
-    1. 停掉 song-rvc 和点歌监听
-    2. 删掉拷进服务目录的脚本（不删 state 里的日志和缓存）
-    3. 用最近的 .bak-* 还原四处补丁（SurfCore ×3 + Coopanion ×1）
-
+    点歌翻唱全套 —— 卸载（默认只删脚本，保留软件和音色）
 .EXAMPLE
+    .\uninstall.ps1                       # 停服务 + 删点歌脚本和 DDSP
+    .\uninstall.ps1 -RemoveVendor         # 连 Coopanion / SnowLuma / SurfCore 一起删
+    .\uninstall.ps1 -KeepDdsp             # 保留 DDSP（800MB，重装省事）
     .\uninstall.ps1 -DryRun
-    .\uninstall.ps1
-    .\uninstall.ps1 -KeepPatches      # 只停服务、删脚本，保留补丁
 #>
 [CmdletBinding()]
 param(
-    [string]$SurfcorePath,
-    [string]$CoopanionPath,
-    [string]$StateDir,
-    [switch]$KeepPatches,
+    [string]$CoopanionPath = "D:\Coopanion",
+    [string]$SnowLumaPath  = "D:\大肥鱼的实验室\SnowLuma",
+    [string]$SurfcorePath  = "D:\surfcore",
+    [string]$StateDir      = "",
+    [string]$DdspPath      = "",
+    [switch]$RemoveVendor,
+    [switch]$KeepDdsp,
     [switch]$DryRun
 )
-
 $ErrorActionPreference = 'Continue'
+if (-not $StateDir) { $StateDir = Join-Path $SurfcorePath 'state' }
+if (-not $DdspPath) { $DdspPath = Join-Path $StateDir 'ddsp-svc' }
 
-function Say([string]$m, [string]$lvl = 'info') {
+function Say([string]$m, [string]$lvl='info') {
     switch ($lvl) {
         'ok'   { Write-Host "  [OK]   $m" -ForegroundColor Green }
         'skip' { Write-Host "  [SKIP] $m" -ForegroundColor DarkGray }
         'warn' { Write-Host "  [WARN] $m" -ForegroundColor Yellow }
-        'todo' { Write-Host "  [TODO] $m" -ForegroundColor Cyan }
-        default { Write-Host "  $m" }
+        default{ Write-Host "  $m" }
     }
 }
-function Step([string]$t) { Write-Host ""; Write-Host "== $t" -ForegroundColor Cyan }
+Write-Host "点歌翻唱全套 · 卸载" -ForegroundColor White
+if ($DryRun) { Write-Host "（DryRun：不删任何东西）" -ForegroundColor Yellow }
 
-function Probe-Surfcore {
-    if ($SurfcorePath -and (Test-Path (Join-Path $SurfcorePath 'src\bridge.js'))) { return $SurfcorePath }
-    foreach ($c in @('D:\surfcore', 'C:\surfcore')) { if (Test-Path (Join-Path $c 'src\bridge.js')) { return $c } }
-    return $null
-}
-function Probe-Coopanion {
-    if ($CoopanionPath -and (Test-Path (Join-Path $CoopanionPath 'Coopanion.exe'))) { return $CoopanionPath }
-    foreach ($c in @('D:\Coopanion', 'C:\Program Files\Coopanion')) { if (Test-Path (Join-Path $c 'Coopanion.exe')) { return $c } }
-    return $null
-}
+Write-Host ""
+Write-Host "== 1. 停止服务" -ForegroundColor Cyan
+$mp = Join-Path $StateDir 'music-plugin.ps1'
+if (Test-Path $mp -and -not $DryRun) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $mp stop 2>$null
+    Say "已调用 music-plugin.ps1 stop"
+} else { Say '跳过（或 DryRun）' 'skip' }
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+    Where-Object { $_.CommandLine -match 'song-cmd-poll|song-rvc\.py' } |
+    ForEach-Object {
+        if ($DryRun) { Say "将结束 PID $($_.ProcessId)" }
+        else { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Say "结束 PID $($_.ProcessId)" }
+    }
 
-# 用同一目录下最新的 .bak-* 还原
-function Restore-Latest([string]$file) {
-    if (-not (Test-Path $file)) { Say "文件不存在，跳过：$file" 'skip'; return }
-    $dir = Split-Path -Parent $file
-    $leaf = Split-Path -Leaf $file
-    $bak = Get-ChildItem $dir -Filter "$leaf.bak-*" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (-not $bak) { Say "没有备份可还原：$leaf" 'skip'; return }
-    if ($DryRun) { Say "将用 $($bak.Name) 还原 $leaf" 'todo'; return }
-    Copy-Item $bak.FullName $file -Force
-    Say "已还原 $leaf（来自 $($bak.Name)）" 'ok'
-}
-
-Write-Host "QQ 点歌翻唱套件 · 卸载" -ForegroundColor White
-if ($DryRun) { Write-Host "（DryRun：不会做任何改动）" -ForegroundColor Yellow }
-
-$sc = Probe-Surfcore
-$coop = Probe-Coopanion
-if (-not $StateDir) {
-    if ($sc) { $StateDir = Join-Path $sc 'state' } elseif ($env:SC_STATE_DIR) { $StateDir = $env:SC_STATE_DIR } else { $StateDir = 'D:\surfcore\state' }
-}
-
-Step '1. 停服务'
-if ($DryRun) {
-    Say "将执行：music-plugin.ps1 stop" 'todo'
-} elseif (Test-Path (Join-Path $StateDir 'music-plugin.ps1')) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $StateDir 'music-plugin.ps1') stop
-} else {
-    # 兜底：直接杀
-    Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'song-rvc\.py|song-cmd-poll\.py' } |
-        ForEach-Object { if (-not $DryRun) { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
-    Say "已按命令行杀掉两个 python" 'ok'
-}
-
-# 守护也停掉
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -match 'song-guard' } |
-    ForEach-Object { if (-not $DryRun) { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
-Say "守护进程已停（如有）" 'ok'
-
-Step '2. 删服务脚本'
-$files = @('song-rvc.py', 'song-cmd-poll.py', 'song-guard.ps1', 'song-rvc-guard.bat',
-    'music-plugin.ps1', '音乐插件-启动.bat', '音乐插件-停止.bat')
-foreach ($f in $files) {
+Write-Host ""
+Write-Host "== 2. 删点歌脚本" -ForegroundColor Cyan
+foreach ($f in @('song-rvc.py','song-cmd-poll.py','song-guard.ps1','song-control.ps1',
+                 'music-plugin.ps1','song-rvc-guard.bat','音乐插件-启动.bat','音乐插件-停止.bat',
+                 'song-cmd-seen.json')) {
     $p = Join-Path $StateDir $f
     if (Test-Path $p) {
-        if ($DryRun) { Say "将删除 $f" 'todo' } else { Remove-Item $p -Force; Say "已删除 $f" 'ok' }
+        if ($DryRun) { Say "将删除 $f" }
+        else { Remove-Item $p -Force -ErrorAction SilentlyContinue; Say "删除 $f" 'ok' }
     }
 }
-Say "（日志 song-*.log / 缓存 song-cache 保留，要清自己删）" 'skip'
 
-if ($KeepPatches) {
-    Step '3. 补丁（-KeepPatches，跳过）'
-} else {
-    Step '3. 还原补丁'
-    if ($sc) {
-        Restore-Latest (Join-Path $sc 'src\command-spam.js')
-        Restore-Latest (Join-Path $sc 'src\bridge.js')
-        Restore-Latest (Join-Path $sc 'config.json')
-        Say "SurfCore 改完要重启桥接（restart.bat）" 'warn'
-    } else { Say '没找到 SurfCore' 'skip' }
-    if ($coop) {
-        $worker = Join-Path $coop 'data\extensions\node_modules\@wocwang\cortico-world-rvc-for-coopanion\src\python\worker.py'
-        Restore-Latest $worker
-        if (-not $DryRun) {
-            try {
-                Invoke-WebRequest 'http://127.0.0.1:17788/api/worlds/restart' -Method POST -Body '{"id":"rvc"}' `
-                    -ContentType 'application/json' -TimeoutSec 15 -UseBasicParsing | Out-Null
-                Say "RVC world 已重启" 'ok'
-            } catch { Say "重启 RVC 失败（Coopanion 没开？）" 'warn' }
+if (-not $KeepDdsp) {
+    Write-Host ""
+    Write-Host "== 3. 删 DDSP-SVC（含模型 800MB）" -ForegroundColor Cyan
+    if (Test-Path $DdspPath) {
+        if ($DryRun) { Say "将删除 $DdspPath" }
+        else { Remove-Item $DdspPath -Recurse -Force -ErrorAction SilentlyContinue; Say "删除 $DdspPath" 'ok' }
+    } else { Say '不存在' 'skip' }
+} else { Write-Host ""; Write-Host "== 3. DDSP（-KeepDdsp，保留）" -ForegroundColor Cyan; Say '保留' 'skip' }
+
+if ($RemoveVendor) {
+    Write-Host ""
+    Write-Host "== 4. 删原版软件（危险！）" -ForegroundColor Red
+    foreach ($p in @($CoopanionPath, $SnowLumaPath, $SurfcorePath)) {
+        if (Test-Path $p) {
+            if ($DryRun) { Say "将删除 $p" }
+            else {
+                Say "删除 $p（3 秒后，Ctrl+C 可取消）" 'warn'
+                Start-Sleep -Seconds 3
+                Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+                Say "已删除 $p" 'ok'
+            }
         }
-    } else { Say '没找到 Coopanion' 'skip' }
+    }
+} else {
+    Write-Host ""
+    Write-Host "== 4. 原版软件（保留）" -ForegroundColor Cyan
+    Say '加 -RemoveVendor 才会删' 'skip'
 }
 
-Step '汇总'
-if ($DryRun) { Write-Host "  DryRun 结束。" -ForegroundColor Yellow }
-else { Write-Host "  卸载完成。" -ForegroundColor Green }
+Write-Host ""
+Write-Host "== 5. 还原备份" -ForegroundColor Cyan
+$baks = Get-ChildItem -Path $SurfcorePath, $CoopanionPath -Filter '*.bak-*' -Recurse -File -ErrorAction SilentlyContinue
+if ($baks) {
+    foreach ($b in $baks) {
+        $orig = $b.FullName -replace '\.bak-\d{8}-\d{6}$', ''
+        if ($DryRun) { Say "将还原 $($b.Name) → $(Split-Path -Leaf $orig)" }
+        else { Copy-Item $b.FullName $orig -Force -ErrorAction SilentlyContinue; Say "还原 $(Split-Path -Leaf $orig)" 'ok' }
+    }
+} else { Say '没有备份文件' 'skip' }
+
+Write-Host ""
+Write-Host "== 6. 清环境变量" -ForegroundColor Cyan
+foreach ($v in @('SONG_ENGINE','SONG_DDSP_DIR','SC_OWNER','DDSP_STEP','DDSP_HIGHPASS','DDSP_GAIN','DDSP_INST_GAIN')) {
+    if ($DryRun) { Say "将清除 $v" }
+    else { [Environment]::SetEnvironmentVariable($v, $null, 'User'); Say "清除 $v" 'ok' }
+}
+
+Write-Host ""
+Write-Host "卸载完成。" -ForegroundColor Green
+Write-Host "（音色模型、聊天记录、点歌缓存都保留着，重装可以直接用）" -ForegroundColor DarkGray
